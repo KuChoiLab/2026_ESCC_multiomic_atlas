@@ -309,4 +309,144 @@ p3 <- SpatialDimPlot(seurat_obj, group.by = "niche", cols = mycol, pt.size.facto
 p4 <- SpatialDimPlot(seurat_obj, group.by = "niche", cols = mycol, pt.size.factor = 1.8, images = c("s10")) & NoLegend() & theme(aspect.ratio = 1)
 p1+p2+p3+p4+plot_layout(ncol = 4)
 
-# Fig1F (DL) ----
+# Fig1F ----
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(rstatix)
+library(ggplot2)
+library(scales)
+
+seurat_obj <- readRDS('data/visium/20250821_escc_visium_c2f_scaled_latest_dl.rds')
+
+# prep cell type composition per niche
+c2l_data <- GetAssayData(seurat_obj, assay = "C2L", slot = "data")
+cluster_info <- seurat_obj$niche
+
+keep_ct <- c(
+  "Tumor", "Basal", "Suprabasal", "Glandular cell",
+  "Memory B", "GC DZ", "GC LZ", "Plasma cell",
+  "CD8 inflammatory Trm", "CD8 CXCR6+ Trm", "CD4 Tn",
+  "SMC", "NMF", "Pericyte", "BEC"
+)
+
+niche_order <- c("niche8", "niche1", "niche5", "niche4",
+                 "niche12", "niche7", "niche10", "niche11",
+                 "niche3", "niche9", "niche2", "niche6")
+
+# per-niche mean abundance
+df <- t(c2l_data) %>%
+  as.data.frame() %>%
+  mutate(cluster = cluster_info) %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  pivot_longer(-cluster, names_to = "CellType", values_to = "Expression") %>%
+  filter(CellType %in% keep_ct) %>%
+  mutate(
+    cluster  = factor(as.character(cluster),  levels = niche_order),
+    CellType = factor(as.character(CellType), levels = keep_ct)
+  ) %>%
+  complete(cluster, CellType, fill = list(Expression = 0))
+
+# spot-level data for stats
+df_raw <- t(c2l_data) %>%
+  as.data.frame() %>%
+  mutate(cluster = cluster_info) %>%
+  pivot_longer(-cluster, names_to = "CellType", values_to = "value") %>%
+  filter(CellType %in% keep_ct) %>%
+  mutate(
+    cluster  = factor(as.character(cluster),  levels = niche_order),
+    CellType = factor(as.character(CellType), levels = keep_ct)
+  ) %>%
+  filter(!is.na(cluster), is.finite(value))
+
+# wilcoxon: in-niche vs out-of-niche, bonferroni correction
+pvals <- df_raw %>%
+  group_by(CellType) %>%
+  group_modify(~ {
+    map_dfr(levels(.x$cluster), function(cl) {
+      a <- .x %>% filter(cluster == cl)  %>% pull(value)
+      b <- .x %>% filter(cluster != cl) %>% pull(value)
+      
+      if (length(a) >= 5 && length(b) >= 5 && (sd(a) > 0 || sd(b) > 0)) {
+        wt <- wilcox_test(
+          data.frame(v = c(a, b),
+                     g = factor(c(rep("in", length(a)), rep("out", length(b))),
+                                levels = c("in", "out"))),
+          v ~ g, alternative = "greater", detailed = TRUE, exact = FALSE
+        )
+        tibble(cluster = cl, p = wt$p,
+               median_in = median(a), median_out = median(b),
+               log2FC = log2((median(a) + 1e-6) / (median(b) + 1e-6)))
+      } else {
+        tibble(cluster = cl, p = NA_real_,
+               median_in = median(a), median_out = median(b), log2FC = NA_real_)
+      }
+    })
+  }) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p, method = "bonferroni")) %>%
+  mutate(
+    enriched = !is.na(p_adj) & p_adj < 0.05 & median_in > median_out & log2FC >= log2(1.5),
+    star = case_when(
+      enriched & p_adj < 0.001 ~ "**",
+      enriched & p_adj < 0.05  ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+# row z-score
+df_scaled <- df %>%
+  group_by(CellType) %>%
+  mutate(Expression_z = if (sd(Expression, na.rm = TRUE) == 0) 0
+         else as.numeric(scale(Expression))) %>%
+  ungroup() %>%
+  mutate(Expression_z = ifelse(is.finite(Expression_z), Expression_z, 0))
+
+max_abs <- max(abs(df_scaled$Expression_z), na.rm = TRUE)
+
+df_anno <- df_scaled %>%
+  left_join(pvals %>% select(CellType, cluster, p_adj, star),
+            by = c("CellType", "cluster")) %>%
+  mutate(
+    cluster  = factor(cluster,  levels = niche_order),
+    CellType = factor(CellType, levels = keep_ct)
+  )
+
+# heatmap
+pretty_colors <- c("#2166AC", "#4393C3", "#F7F7F7", "#FDDBC7", "#B2182B")
+
+p <- ggplot(df_anno, aes(x = cluster, y = CellType, fill = Expression_z)) +
+  geom_tile() +
+  geom_tile(fill = NA, colour = "black", linewidth = 0.1) +
+  scale_fill_gradientn(
+    colours = pretty_colors,
+    values  = scales::rescale(c(-max_abs, -max_abs/2, 0, max_abs/2, max_abs)),
+    limits  = c(-max_abs, max_abs),
+    name    = "Z-score"
+  ) +
+  geom_text(
+    data = ~ filter(.x, Expression_z >= 0),
+    aes(label = star), size = 2.1, color = "black"
+  ) +
+  scale_x_discrete(limits = niche_order) +
+  scale_y_discrete(limits = keep_ct) +
+  theme_minimal(base_size = 3, base_family = "Arial") +
+  theme(
+    axis.text.x  = element_text(size = 4, angle = 45, hjust = 1, vjust = 1),
+    axis.text.y  = element_text(size = 4),
+    axis.title.x = element_text(size = 5, face = "bold"),
+    axis.title.y = element_text(size = 5, face = "bold"),
+    legend.title = element_text(size = 4, face = "bold"),
+    legend.text  = element_text(size = 4),
+    panel.grid   = element_blank(),
+    plot.margin  = unit(c(0.1, 0.1, 0.1, 0.1), "cm")
+  ) +
+  labs(x = "Niche", y = "Cell Type")
+
+cairo_pdf("figure/Fig3/escc_c2l_celltype_niche_heatmap.pdf",
+          width = cm_to_inch(6), height = cm_to_inch(5), family = "Arial")
+print(p)
+dev.off()
+
+
